@@ -287,6 +287,14 @@ def load_ledger():
         if _LEDGER_CACHE is None:
             _LEDGER_CACHE = _load_ledger_uncached()
         return _LEDGER_CACHE
+# Warm up the ledger cache when the server starts.
+try:
+    load_ledger()
+    app.logger.info("Ledger cache warmed successfully.")
+except Exception:
+    app.logger.exception(
+        "Ledger warm-up failed; it will retry on the first question."
+    )
 
 
 def row_date(row):
