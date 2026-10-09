@@ -418,6 +418,20 @@ def answer_question(question):
     # Only paid orders count as revenue.
     paid = [r for r in selected if row_status(r) == "paid"]
 
+    # Average value of paid orders, including USD conversion when requested.
+    average_question = (
+        any(word in q for word in ("average", "mean", "per order", "order worth"))
+        or ("worth" in q and "order" in q)
+    )
+    if average_question and ("order" in q or "orders" in q):
+        if not paid:
+            return 0
+        if re.search(r"\\b(usd|us dollars?|dollars?)\\b", q):
+            values = [amount_usd(r, rates) for r in paid]
+        else:
+            values = [row_amount(r) or 0 for r in paid]
+        return round(sum(values) / len(values), 2)
+
     if any(word in q for word in ("refund", "refunded", "money returned")):
         return round(sum(row_refund(r) for r in selected), 2)
 
