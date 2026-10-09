@@ -21,22 +21,43 @@ session.headers.update({"User-Agent": "AcmeLedgerAgent/1.0"})
 
 
 def fetch(url):
-    """Fetch a JSON or CSV endpoint."""
+    """Fetch JSON, JSON Lines, or CSV data."""
     response = session.get(url, timeout=TIMEOUT)
     response.raise_for_status()
-
     content_type = response.headers.get("Content-Type", "").lower()
 
     if "json" in content_type:
-        return response.json()
+        try:
+            return response.json()
+        except ValueError:
+            pass
 
     text = response.text.strip()
+    if not text:
+        return []
+
     try:
         return json.loads(text)
     except (ValueError, TypeError):
-        if "," in text and "\n" in text:
+        pass
+
+    # Some export endpoints return one JSON object per line.
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) > 1:
+        try:
+            parsed = [json.loads(line) for line in lines]
+            if all(isinstance(item, (dict, list)) for item in parsed):
+                return parsed
+        except (ValueError, TypeError):
+            pass
+
+    if "," in text and "\\n" in text:
+        try:
             return list(csv.DictReader(io.StringIO(text)))
-        return text
+        except (csv.Error, ValueError):
+            pass
+
+    return text
 
 
 def find_rows(data):
@@ -263,6 +284,42 @@ def row_amount(row):
     ))
 
 
+
+def amount_usd(row, rates_data):
+    """Convert an order amount to USD using the ledger's usd_per_unit rates."""
+    direct = parse_number(get_value(
+        row, ["total_usd", "amount_usd", "revenue_usd"]
+    ))
+    if direct is not None:
+        return direct
+
+    amount = parse_number(get_value(
+        row, ["order_total", "total_amount", "total", "amount",
+              "line_total", "net_amount", "price"]
+    ))
+
+    if amount is None:
+        unit_price = parse_number(get_value(row, ["unit_price"]))
+        quantity = parse_number(get_value(row, ["qty", "quantity"]))
+        if unit_price is not None:
+            amount = unit_price * (quantity if quantity is not None else 1)
+
+    if amount is None:
+        return 0.0
+
+    currency = str(get_value(row, ["currency"], "USD")).upper()
+    rates = rates_data.get("usd_per_unit", {}) if isinstance(rates_data, dict) else {}
+    rate = parse_number(rates.get(currency))
+
+    if currency == "USD":
+        rate = 1.0
+    elif rate is None:
+        # Do not silently apply a fabricated exchange rate.
+        raise ValueError(f"No USD conversion rate for currency {currency}")
+
+    return amount * rate
+
+
 def row_refund(row):
     return parse_number(get_value(
         row,
@@ -374,13 +431,14 @@ def answer_question(question):
             row_customer(r) for r in selected if row_customer(r)
         })
 
-    if any(word in q for word in ("top product", "best-selling product",
+    if any(word in q for word in ("top product", "top-selling product", "top selling product",
+                                  "best-selling product", "best selling product",
                                   "bestselling product", "most popular product")):
         totals = {}
         for r in paid:
             name = row_product(r)
             if name:
-                totals[name] = totals.get(name, 0) + (row_amount(r) or 0)
+                totals[name] = totals.get(name, 0) + amount_usd(r, rates)
         return max(totals, key=totals.get) if totals else None
 
     if any(word in q for word in ("top customer", "biggest customer",
@@ -389,11 +447,13 @@ def answer_question(question):
         for r in paid:
             name = row_customer(r)
             if name:
-                totals[name] = totals.get(name, 0) + (row_amount(r) or 0)
+                totals[name] = totals.get(name, 0) + amount_usd(r, rates)
         return max(totals, key=totals.get) if totals else None
 
     # Default: questions about revenue, sales or total sales.
     if any(word in q for word in ("revenue", "sales", "sold", "income", "total", "earn", "earned", "make", "made", "generate", "generated")):
+        if re.search(r"\\b(usd|us dollars?|dollars?)\\b", q):
+            return round(sum(amount_usd(r, rates) for r in paid), 2)
         return round(sum(row_amount(r) or 0 for r in paid), 2)
 
     return {
