@@ -432,8 +432,57 @@ def answer_question(question):
             values = [row_amount(r) or 0 for r in paid]
         return round(sum(values) / len(values), 2)
 
-    if any(word in q for word in ("refund", "refunded", "money returned")):
-        return round(sum(row_refund(r) for r in selected), 2)
+    # Handle refund counts separately from refund amounts.
+    refund_question = any(
+        word in q for word in ("refund", "refunded", "money returned")
+    )
+
+    if refund_question:
+        refunded = [
+            r for r in selected
+            if row_status(r) in ("refunded", "partially_refunded",
+                                 "partially refunded")
+        ]
+
+        asks_count = (
+            "how many" in q
+            or "number of" in q
+            or "count of" in q
+            or "count the" in q
+            or "quantity of" in q
+        )
+
+        if asks_count:
+            return len(refunded)
+
+        # Prefer explicit refund fields; otherwise treat refunded
+        # orders as full-order refunds using their order amounts.
+        asks_usd = bool(re.search(r"\\b(usd|us dollars?|dollars?)\\b", q))
+        total = 0.0
+
+        for r in refunded:
+            direct_usd = parse_number(get_value(
+                r, ["refund_usd", "refund_amount_usd"]
+            ))
+            refund_value = row_refund(r)
+
+            if asks_usd:
+                if direct_usd is not None:
+                    total += direct_usd
+                elif refund_value:
+                    currency = str(get_value(r, ["currency"], "USD")).upper()
+                    rate_map = rates.get("usd_per_unit", {}) if isinstance(rates, dict) else {}
+                    rate = parse_number(rate_map.get(currency))
+                    if currency == "USD":
+                        rate = 1.0
+                    if rate is not None:
+                        total += refund_value * rate
+                else:
+                    total += amount_usd(r, rates)
+            else:
+                total += refund_value if refund_value else (row_amount(r) or 0)
+
+        return round(total, 2)
 
     if any(word in q for word in ("how many orders", "number of orders",
                                   "count of orders", "order count")):
