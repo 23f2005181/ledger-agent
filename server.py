@@ -426,7 +426,7 @@ def answer_question(question):
     if average_question and ("order" in q or "orders" in q):
         if not paid:
             return 0
-        if re.search(r"\b(usd|us dollars?|dollars?)\\b", q):
+        if re.search(r"\b(usd|us dollars?|dollars?)\b", q):
             values = [amount_usd(r, rates) for r in paid]
         else:
             values = [row_amount(r) or 0 for r in paid]
@@ -488,7 +488,7 @@ def answer_question(question):
 
     # Default: questions about revenue, sales or total sales.
     if any(word in q for word in ("revenue", "sales", "sold", "income", "total", "earn", "earned", "make", "made", "generate", "generated")):
-        if re.search(r"\b(usd|us dollars?|dollars?)\\b", q):
+        if re.search(r"\b(usd|us dollars?|dollars?)\b", q):
             return round(sum(amount_usd(r, rates) for r in paid), 2)
         return round(sum(row_amount(r) or 0 for r in paid), 2)
 
