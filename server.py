@@ -439,10 +439,32 @@ def answer_question(question):
                                   "count of orders", "order count")):
         return len(selected)
 
-    if any(word in q for word in ("how many customers", "number of customers",
-                                  "unique customers", "customer count")):
+    # Count distinct customers, with optional paid-only restriction.
+    customer_count_phrases = (
+        "how many customers",
+        "how many distinct customers",
+        "distinct customers",
+        "number of customers",
+        "unique customers",
+        "customer count",
+        "customers have bought",
+        "customers bought",
+        "customers purchased",
+        "customers have purchased",
+    )
+
+    if any(phrase in q for phrase in customer_count_phrases):
+        paid_only_requested = any(phrase in q for phrase in (
+            "paid orders only",
+            "paid only",
+            "only paid",
+            "paid orders",
+        ))
+        customer_rows = paid if paid_only_requested else selected
         return len({
-            row_customer(r) for r in selected if row_customer(r)
+            row_customer(r)
+            for r in customer_rows
+            if row_customer(r)
         })
 
     if any(word in q for word in ("top product", "top-selling product", "top selling product",
