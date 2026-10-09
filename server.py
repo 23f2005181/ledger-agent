@@ -1,604 +1,588 @@
-
 import os
 import re
-import csv
 import io
+import csv
 import json
 import calendar
-from concurrent.futures import ThreadPoolExecutor
 import threading
-from datetime import datetime, date
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, urljoin
+from zoneinfo import ZoneInfo
 
 import requests
+from requests.adapters import HTTPAdapter
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
+log = app.logger
 
 ROOT_URL = os.environ.get("LEDGER_URL", "").strip()
 TIMEOUT = 10
+IST = ZoneInfo("Asia/Kolkata")
+UTC = timezone.utc
+MIN_DT = datetime.min.replace(tzinfo=UTC)
+ZERO = Decimal(0)
 
 session = requests.Session()
-session.headers.update({"User-Agent": "AcmeLedgerAgent/1.0"})
+session.headers.update({"User-Agent": "AcmeLedgerAgent/2.0"})
+session.mount("https://", HTTPAdapter(max_retries=2, pool_connections=10, pool_maxsize=10))
 
 
+# ----------------------------------------------------------------- fetching
 def fetch(url):
-    """Fetch JSON, JSON Lines, or CSV data."""
     response = session.get(url, timeout=TIMEOUT)
     response.raise_for_status()
-    content_type = response.headers.get("Content-Type", "").lower()
-
-    if "json" in content_type:
+    ctype = response.headers.get("Content-Type", "").lower()
+    if "json" in ctype:
         try:
             return response.json()
         except ValueError:
             pass
-
     text = response.text.strip()
     if not text:
         return []
-
     try:
         return json.loads(text)
     except (ValueError, TypeError):
         pass
-
-    # Some export endpoints return one JSON object per line.
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     if len(lines) > 1:
         try:
-            parsed = [json.loads(line) for line in lines]
-            if all(isinstance(item, (dict, list)) for item in parsed):
+            parsed = [json.loads(ln) for ln in lines]
+            if all(isinstance(i, (dict, list)) for i in parsed):
                 return parsed
         except (ValueError, TypeError):
             pass
-
-    if "," in text and "\\n" in text:
+    if "," in text and "\n" in text:
         try:
             return list(csv.DictReader(io.StringIO(text)))
         except (csv.Error, ValueError):
             pass
-
     return text
 
 
 def find_rows(data):
-    """Extract row-like dictionaries from common API response formats."""
     if isinstance(data, list):
-        if all(isinstance(item, dict) for item in data):
+        if all(isinstance(i, dict) for i in data):
             return data
         rows = []
         for item in data:
             rows.extend(find_rows(item))
         return rows
-
     if not isinstance(data, dict):
         return []
-
     for key in ("orders", "rows", "records", "results", "items", "data"):
         value = data.get(key)
         if isinstance(value, list):
             return find_rows(value)
-
     for value in data.values():
-        if isinstance(value, list) and value and all(
-            isinstance(item, dict) for item in value
-        ):
+        if isinstance(value, list) and value and all(isinstance(i, dict) for i in value):
             return value
-
     return []
 
 
+PAGE_KEYS = ("pages", "total_pages", "totalPages", "page_count", "num_pages")
+
+
+def total_pages_of(payload):
+    if not isinstance(payload, dict):
+        return 0
+    for src in (payload, payload.get("meta"), payload.get("pagination")):
+        if isinstance(src, dict):
+            for k in PAGE_KEYS:
+                try:
+                    v = int(src.get(k))
+                    if v:
+                        return v
+                except (TypeError, ValueError):
+                    continue
+    return 0
+
+
+def page_url(first_url, n):
+    parts = urlparse(first_url)
+    params = parse_qs(parts.query)
+    params["page"] = [str(n)]
+    return urlunparse(parts._replace(query=urlencode(params, doseq=True)))
+
+
 def fetch_all_pages(first_url):
-    """Fetch paginated orders concurrently when total pages are available."""
     first_payload = fetch(first_url)
-    first_rows = find_rows(first_payload)
-
+    rows = list(find_rows(first_payload))
     if not isinstance(first_payload, dict):
-        return first_rows
-
-    try:
-        total_pages = int(first_payload.get("pages", 0))
-    except (TypeError, ValueError):
-        total_pages = 0
-
-    if total_pages > 1:
-        parts = urlparse(first_url)
-        base_params = parse_qs(parts.query)
-
-        def fetch_page(page_number):
-            params = dict(base_params)
-            params["page"] = [str(page_number)]
-            page_url = urlunparse(
-                parts._replace(query=urlencode(params, doseq=True))
-            )
-            return find_rows(fetch(page_url))
-
-        page_numbers = range(2, total_pages + 1)
-        with ThreadPoolExecutor(max_workers=10) as pool:
-            page_results = list(pool.map(fetch_page, page_numbers))
-
-        rows = list(first_rows)
-        for page_rows in page_results:
-            rows.extend(page_rows)
         return rows
 
-    # Fallback for APIs that expose only next-page links.
-    all_rows = list(first_rows)
-    seen_urls = {first_url}
-    url = first_payload.get("next")
+    total = total_pages_of(first_payload)
+    if total > 1:
+        def one(n):
+            return find_rows(fetch(page_url(first_url, n)))
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for part in pool.map(one, range(2, total + 1)):
+                rows.extend(part)
+        return rows
 
-    while url:
-        url = requests.compat.urljoin(first_url, url)
-        if url in seen_urls:
+    seen = {first_url}
+    payload = first_payload
+    page_no = 1
+    while isinstance(payload, dict):
+        nxt = payload.get("next") or payload.get("next_page") or payload.get("next_url")
+        if not nxt:
             break
-        seen_urls.add(url)
-
+        if isinstance(nxt, int) or (isinstance(nxt, str) and nxt.isdigit()):
+            page_no = int(nxt)
+            url = page_url(first_url, page_no)
+        else:
+            url = urljoin(first_url, str(nxt))
+        if url in seen:
+            break
+        seen.add(url)
         payload = fetch(url)
-        rows = find_rows(payload)
-        if not rows:
+        part = find_rows(payload)
+        if not part:
             break
-        all_rows.extend(rows)
-
-        if not isinstance(payload, dict):
-            break
-        url = payload.get("next")
-
-    return all_rows
+        rows.extend(part)
+    return rows
 
 
+# ------------------------------------------------------------------ helpers
 def key_norm(value):
     return re.sub(r"[^a-z0-9]", "", str(value).lower())
 
 
 def get_value(row, aliases, default=None):
-    """Look up fields despite variations in capitalization or separators."""
     if not isinstance(row, dict):
         return default
-
     normalized = {key_norm(k): v for k, v in row.items()}
     for alias in aliases:
-        key = key_norm(alias)
-        if key in normalized and normalized[key] not in (None, ""):
-            return normalized[key]
+        k = key_norm(alias)
+        if k in normalized and normalized[k] not in (None, ""):
+            return normalized[k]
     return default
 
 
-def parse_number(value):
-    if isinstance(value, (int, float)):
-        return float(value)
-
-    if value is None:
+def num(value):
+    if value is None or value == "" or isinstance(value, bool):
         return None
-
-    text = str(value).strip().replace(",", "")
-    text = re.sub(r"[$₹£€]", "", text)
-
+    if isinstance(value, (int, float)):
+        return Decimal(str(value))
+    text = re.sub(r"[^\d.\-]", "", str(value).replace(",", ""))
+    if text in ("", "-", "."):
+        return None
     try:
-        return float(text)
-    except ValueError:
+        return Decimal(text)
+    except Exception:
         return None
 
 
-def parse_date(value):
-    if not value:
-        return None
+FALLBACK_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y",
+                    "%m/%d/%Y", "%d %b %Y", "%b %d, %Y")
 
+
+def parse_dt(value):
+    """Return an aware datetime in Asia/Kolkata. Naive values are taken as IST."""
+    if value is None or value == "" or isinstance(value, bool):
+        return None
     if isinstance(value, (int, float)):
+        v = float(value)
+        if v > 1e11:
+            v /= 1000.0
         try:
-            return datetime.fromtimestamp(value).date()
+            return datetime.fromtimestamp(v, tz=UTC).astimezone(IST)
         except (ValueError, OSError, OverflowError):
             return None
-
     text = str(value).strip()
-    for fmt in (
-        "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%d %H:%M:%S", "%m/%d/%Y",
-        "%d-%m-%Y", "%Y-%m-%dT%H:%M:%S.%f",
-    ):
-        try:
-            return datetime.strptime(text[:26], fmt).date()
-        except ValueError:
-            pass
-
-    try:
-        return date.fromisoformat(text[:10])
-    except ValueError:
+    if not text:
         return None
+    if re.fullmatch(r"\d{9,13}(\.\d+)?", text):
+        return parse_dt(float(text))
+    iso = re.sub(r"[Zz]$", "+00:00", text)
+    try:
+        dt = datetime.fromisoformat(iso)
+    except ValueError:
+        dt = None
+        for fmt in FALLBACK_FORMATS:
+            try:
+                dt = datetime.strptime(text, fmt)
+                break
+            except ValueError:
+                continue
+        if dt is None:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=IST)
+    return dt.astimezone(IST)
+
+
+ID_KEYS = ["order_id", "orderId", "id", "order_number"]
+UPDATED_KEYS = ["updated_at", "updatedAt", "last_updated", "modified_at"]
+DATE_KEYS = ["order_date", "date", "created_at", "createdAt", "placed_at", "ordered_at", "timestamp"]
+USD_KEYS = ["total_usd", "amount_usd", "revenue_usd"]
+AMOUNT_KEYS = ["order_total", "total_amount", "total", "amount", "line_total", "net_amount", "price"]
+REFUND_USD_KEYS = ["refund_usd", "refund_amount_usd"]
+REFUND_KEYS = ["refunded_amount", "refund_amount", "total_refunds", "refund", "amount_refunded"]
+REFUND_STATUSES = {"refunded", "partiallyrefunded", "partialrefund", "partialrefunded"}
 
 
 def latest_orders(rows):
-    """Keep the most recently updated record for each order ID."""
     latest = {}
     without_id = []
-
     for row in rows:
-        order_id = get_value(
-            row, ["order_id", "orderId", "id", "order_number"]
-        )
-        if order_id is None:
+        oid = get_value(row, ID_KEYS)
+        if oid is None:
             without_id.append(row)
             continue
-
-        updated = str(get_value(
-            row, ["updated_at", "updatedAt", "last_updated"], ""
-        ))
-
-        key = str(order_id)
-        previous = latest.get(key)
-
-        if previous is None or updated > previous[0]:
-            latest[key] = (updated, row)
-
+        upd = parse_dt(get_value(row, UPDATED_KEYS)) or MIN_DT
+        k = str(oid).strip()
+        prev = latest.get(k)
+        if prev is None or upd >= prev[0]:
+            latest[k] = (upd, row)
     return [item[1] for item in latest.values()] + without_id
 
 
-def _load_ledger_uncached():
-    if not ROOT_URL:
-        raise RuntimeError("LEDGER_URL environment variable is not configured")
-
-    root = fetch(ROOT_URL)
-    if not isinstance(root, dict):
-        raise RuntimeError("Ledger root endpoint did not return JSON")
-
-    links = root.get("links", {})
-    if not isinstance(links, dict):
-        links = {}
-
-    orders = []
-    export_data = None
-    rates_data = None
-
-    # Prefer the export endpoint if it contains the complete ledger.
-    if links.get("export"):
-        try:
-            export_data = fetch(links["export"])
-            orders = find_rows(export_data)
-        except requests.RequestException:
-            pass
-
-    if not orders and links.get("orders"):
-        orders = fetch_all_pages(links["orders"])
-
-    if links.get("rates"):
-        rates_data = fetch(links["rates"])
-
-    if not orders:
-        raise RuntimeError(
-            "No order rows found. Inspect the orders/export response schema."
-        )
-
-    return latest_orders(orders), rates_data, export_data
-
-
-
-_LEDGER_CACHE = None
-_LEDGER_CACHE_LOCK = threading.Lock()
-
-
-def load_ledger():
-    """Reuse ledger data across questions handled by this worker."""
-    global _LEDGER_CACHE
-
-    if _LEDGER_CACHE is not None:
-        return _LEDGER_CACHE
-
-    with _LEDGER_CACHE_LOCK:
-        if _LEDGER_CACHE is None:
-            _LEDGER_CACHE = _load_ledger_uncached()
-        return _LEDGER_CACHE
-# Warm up the ledger cache when the server starts.
-try:
-    load_ledger()
-    app.logger.info("Ledger cache warmed successfully.")
-except Exception:
-    app.logger.exception(
-        "Ledger warm-up failed; it will retry on the first question."
-    )
-
-
 def row_date(row):
-    return parse_date(get_value(
-        row, ["order_date", "date", "created_at", "createdAt", "timestamp"]
-    ))
+    dt = parse_dt(get_value(row, DATE_KEYS))
+    return dt.date() if dt else None
 
 
 def row_status(row):
-    return str(get_value(row, ["status", "order_status"], "")).lower()
-
-
-def row_amount(row):
-    return parse_number(get_value(
-        row,
-        [
-            "total_usd", "amount_usd", "revenue_usd",
-            "order_total", "total_amount", "total",
-            "amount", "line_total", "net_amount", "price",
-        ],
-    ))
-
-
-
-def amount_usd(row, rates_data):
-    """Convert an order amount to USD using the ledger's usd_per_unit rates."""
-    direct = parse_number(get_value(
-        row, ["total_usd", "amount_usd", "revenue_usd"]
-    ))
-    if direct is not None:
-        return direct
-
-    amount = parse_number(get_value(
-        row, ["order_total", "total_amount", "total", "amount",
-              "line_total", "net_amount", "price"]
-    ))
-
-    if amount is None:
-        unit_price = parse_number(get_value(row, ["unit_price"]))
-        quantity = parse_number(get_value(row, ["qty", "quantity"]))
-        if unit_price is not None:
-            amount = unit_price * (quantity if quantity is not None else 1)
-
-    if amount is None:
-        return 0.0
-
-    currency = str(get_value(row, ["currency"], "USD")).upper()
-    rates = rates_data.get("usd_per_unit", {}) if isinstance(rates_data, dict) else {}
-    rate = parse_number(rates.get(currency))
-
-    if currency == "USD":
-        rate = 1.0
-    elif rate is None:
-        # Do not silently apply a fabricated exchange rate.
-        raise ValueError(f"No USD conversion rate for currency {currency}")
-
-    return amount * rate
-
-
-def row_refund(row):
-    return parse_number(get_value(
-        row,
-        [
-            "refund_usd", "refund_amount_usd",
-            "refunded_amount", "refund_amount",
-            "total_refunds", "refund", "amount_refunded",
-        ],
-    )) or 0.0
+    return key_norm(get_value(row, ["status", "order_status"], ""))
 
 
 def row_region(row):
-    return str(get_value(row, ["region", "sales_region", "territory"], ""))
+    return str(get_value(row, ["region", "sales_region", "territory"], "")).strip()
 
 
 def row_product(row):
-    return str(get_value(
-        row, ["product_name", "product", "item_name", "item", "sku_name"], ""
-    ))
+    return str(get_value(row, ["product_name", "product", "item_name", "item", "sku_name"], "")).strip()
 
 
 def row_customer(row):
-    return str(get_value(
-        row, ["customer_name", "customer", "buyer_name", "client_name"], ""
-    ))
+    return str(get_value(row, ["customer_name", "customer", "buyer_name", "client_name"], "")).strip()
 
 
-def extract_month_year(question):
-    q = question.lower()
-    months = {m.lower(): i for i, m in enumerate(calendar.month_name) if m}
-    months.update({m.lower(): i for i, m in enumerate(calendar.month_abbr) if m})
+def row_units(row):
+    q = num(get_value(row, ["qty", "quantity", "units"]))
+    return q if q is not None else Decimal(1)
 
-    month = None
-    for name, number in months.items():
-        if re.search(r"\b" + re.escape(name) + r"\b", q):
-            month = number
+
+def rate_table(rates_data):
+    if not isinstance(rates_data, dict):
+        return {}
+    table = rates_data
+    for key in ("usd_per_unit", "rates", "usd_rates"):
+        if isinstance(rates_data.get(key), dict):
+            table = rates_data[key]
             break
+    out = {}
+    for k, v in table.items():
+        n = num(v)
+        if n is not None:
+            out[str(k).upper()] = n
+    return out
 
-    year_match = re.search(r"\b(20\d{2})\b", q)
-    year = int(year_match.group(1)) if year_match else None
-    return month, year
+
+def rate_for(row, rates):
+    cur = str(get_value(row, ["currency", "currency_code"], "USD")).strip().upper()
+    if cur in ("USD", "US$", ""):
+        return Decimal(1)
+    r = rates.get(cur)
+    if r is None:
+        raise ValueError("No USD rate for currency %s" % cur)
+    return r
 
 
-def filter_rows(rows, question):
-    q = question.lower()
-    month, year = extract_month_year(q)
-    selected = []
+def amount_usd(row, rates):
+    direct = num(get_value(row, USD_KEYS))
+    if direct is not None:
+        return direct
+    amount = num(get_value(row, AMOUNT_KEYS))
+    if amount is None:
+        cents = num(get_value(row, ["amount_cents", "total_cents"]))
+        if cents is not None:
+            amount = cents / 100
+    if amount is None:
+        unit = num(get_value(row, ["unit_price", "price_each"]))
+        if unit is not None:
+            amount = unit * row_units(row)
+    if amount is None:
+        return ZERO
+    return amount * rate_for(row, rates)
 
-    regions = sorted(
-        {row_region(r) for r in rows if row_region(r)},
-        key=len,
-        reverse=True,
-    )
-    products = sorted(
-        {row_product(r) for r in rows if row_product(r)},
-        key=len,
-        reverse=True,
-    )
-    customers = sorted(
-        {row_customer(r) for r in rows if row_customer(r)},
-        key=len,
-        reverse=True,
-    )
 
-    region = next((v for v in regions if v.lower() in q), None)
-    product = next((v for v in products if v.lower() in q), None)
-    customer = next((v for v in customers if v.lower() in q), None)
+def refund_usd(row, rates):
+    direct = num(get_value(row, REFUND_USD_KEYS))
+    if direct is not None and direct > 0:
+        return direct
+    val = num(get_value(row, REFUND_KEYS))
+    if val is not None and val > 0:
+        return val * rate_for(row, rates)
+    if row_status(row) in REFUND_STATUSES:
+        return amount_usd(row, rates)
+    return ZERO
 
-    for row in rows:
+
+def is_refund_row(row, rates):
+    return row_status(row) in REFUND_STATUSES or refund_usd(row, rates) > 0
+
+
+def money(x):
+    return float(Decimal(x).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+# ------------------------------------------------------------------ loading
+def build_index(rows):
+    def uniq(fn):
+        vals = {fn(r).lower() for r in rows if fn(r)}
+        return sorted((v for v in vals if len(v) >= 2), key=len, reverse=True)
+    return uniq(row_region), uniq(row_product), uniq(row_customer)
+
+
+def _load_uncached():
+    if not ROOT_URL:
+        raise RuntimeError("LEDGER_URL environment variable is not configured")
+    root = fetch(ROOT_URL)
+    if not isinstance(root, dict):
+        raise RuntimeError("Ledger root endpoint did not return JSON")
+    links = root.get("links") if isinstance(root.get("links"), dict) else {}
+
+    candidates = {}
+    if links.get("orders"):
+        try:
+            candidates["orders"] = latest_orders(fetch_all_pages(links["orders"]))
+        except Exception:
+            log.exception("orders fetch failed")
+    if links.get("export"):
+        try:
+            candidates["export"] = latest_orders(find_rows(fetch(links["export"])))
+        except Exception:
+            log.exception("export fetch failed")
+    candidates = {k: v for k, v in candidates.items() if v}
+    if not candidates:
+        raise RuntimeError("No order rows found")
+    best = max(candidates, key=lambda k: len(candidates[k]))
+    rows = candidates[best]
+    log.info("ledger sources: %s -> using %s", {k: len(v) for k, v in candidates.items()}, best)
+
+    rates = {}
+    if links.get("rates"):
+        try:
+            rates = rate_table(fetch(links["rates"]))
+        except Exception:
+            log.exception("rates fetch failed")
+
+    regions, products, customers = build_index(rows)
+    return {"rows": rows, "rates": rates, "regions": regions,
+            "products": products, "customers": customers, "source": best}
+
+
+_CACHE = None
+_LOCK = threading.Lock()
+
+
+def load_ledger():
+    global _CACHE
+    if _CACHE is not None:
+        return _CACHE
+    with _LOCK:
+        if _CACHE is None:
+            _CACHE = _load_uncached()
+        return _CACHE
+
+
+try:
+    load_ledger()
+    log.info("Ledger cache warmed.")
+except Exception:
+    log.exception("Ledger warm-up failed; will retry on first question.")
+
+
+# ------------------------------------------------------------ question parse
+MONTHS = {}
+for _i in range(1, 13):
+    MONTHS[calendar.month_name[_i].lower()] = _i
+    MONTHS[calendar.month_abbr[_i].lower()] = _i
+MONTHS["sept"] = 9
+
+
+def pull_entity(values, orig, low):
+    for v in values:
+        m = re.search(r"(?<![a-z0-9])" + re.escape(v) + r"(?![a-z0-9])", low)
+        if m:
+            return (v, orig[:m.start()] + " " + orig[m.end():], low[:m.start()] + " " + low[m.end():])
+    return None, orig, low
+
+
+def find_months(text):
+    found = []
+    for m in re.finditer(r"\b([A-Za-z]{3,9})\b", text):
+        w = m.group(1).lower()
+        if w not in MONTHS:
+            continue
+        if w == "may":
+            tail = text[m.end():m.end() + 14]
+            ok = (m.group(1) == "May"
+                  and not re.match(r"\s+(i|you|we|they|he|she|it|be|have|not)\b", tail, re.I)) \
+                or re.match(r"\s*,?\s*20\d\d", tail)
+            if not ok:
+                continue
+        found.append(MONTHS[w])
+    return found
+
+
+def parse_period(text):
+    years = {int(y) for y in re.findall(r"\b(20\d{2})\b", text)}
+    months = set()
+    found = find_months(text)
+    if found:
+        if (len(found) == 2 and found[0] <= found[1]
+                and re.search(r"\b(between|from|through|thru|to|till|until)\b|[\u2013\u2014]", text, re.I)):
+            months = set(range(found[0], found[1] + 1))
+        else:
+            months = set(found)
+    else:
+        ords = {"first": 1, "1st": 1, "second": 2, "2nd": 2, "third": 3, "3rd": 3, "fourth": 4, "4th": 4}
+        qn = None
+        m = re.search(r"\bq([1-4])\b", text, re.I)
+        if m:
+            qn = int(m.group(1))
+        else:
+            m = re.search(r"\b(first|second|third|fourth|1st|2nd|3rd|4th)\s+quarter\b", text, re.I)
+            if m:
+                qn = ords[m.group(1).lower()]
+        if qn:
+            months = set(range(3 * (qn - 1) + 1, 3 * qn + 1))
+        else:
+            m = re.search(r"\bh([12])\b|\b(first|second)\s+half\b", text, re.I)
+            if m:
+                h = int(m.group(1)) if m.group(1) else (1 if m.group(2).lower() == "first" else 2)
+                months = set(range(1, 7)) if h == 1 else set(range(7, 13))
+    return months, years
+
+
+def in_scope(row, region, product, customer, months, years):
+    if region and row_region(row).lower() != region:
+        return False
+    if product and row_product(row).lower() != product:
+        return False
+    if customer and row_customer(row).lower() != customer:
+        return False
+    if months or years:
         d = row_date(row)
+        if d is None:
+            return False
+        if months and d.month not in months:
+            return False
+        if years and d.year not in years:
+            return False
+    return True
 
-        if month and (not d or d.month != month):
-            continue
-        if year and (not d or d.year != year):
-            continue
-        if region and row_region(row).lower() != region.lower():
-            continue
-        if product and row_product(row).lower() != product.lower():
-            continue
-        if customer and row_customer(row).lower() != customer.lower():
-            continue
 
-        selected.append(row)
+def top_items(rows, namefn, rates, by_units, n):
+    totals = {}
+    for r in rows:
+        name = namefn(r)
+        if not name:
+            continue
+        val = row_units(r) if by_units else amount_usd(r, rates)
+        totals[name] = totals.get(name, ZERO) + val
+    ranked = sorted(totals.items(), key=lambda kv: (-kv[1], kv[0]))
+    if not ranked:
+        return None
+    if n and n > 1:
+        return [k for k, _ in ranked[:n]]
+    return ranked[0][0]
 
-    return selected
+
+STATUS_HINTS = ("cancel", "pending", "fail", "ship", "deliver", "return")
 
 
 def answer_question(question):
-    rows, rates, export_data = load_ledger()
-    q = question.lower()
-    selected = filter_rows(rows, question)
+    L = load_ledger()
+    rows, rates = L["rows"], L["rates"]
+    qf = question.strip().lower()
 
-    if not selected:
-        return 0
+    orig, low = question.strip(), qf
+    product, orig, low = pull_entity(L["products"], orig, low)
+    customer, orig, low = pull_entity(L["customers"], orig, low)
+    region, orig, low = pull_entity(L["regions"], orig, low)
+    months, years = parse_period(orig)
 
-    # Only paid orders count as revenue.
+    selected = [r for r in rows if in_scope(r, region, product, customer, months, years)]
     paid = [r for r in selected if row_status(r) == "paid"]
 
-    # Average value of paid orders, including USD conversion when requested.
-    average_question = (
-        any(word in q for word in ("average", "mean", "per order", "order worth"))
-        or ("worth" in q and "order" in q)
-    )
-    if average_question and ("order" in q or "orders" in q):
+    # --- refunds
+    if re.search(r"refund|money returned", qf):
+        refunded = [r for r in selected if is_refund_row(r, rates)]
+        asks_money = re.search(r"\b(usd|dollars?|how much|amount)\b|\$", qf)
+        asks_count = re.search(r"\b(how many|number of|count)\b", qf)
+        if asks_count and not asks_money:
+            return len(refunded)
+        return money(sum((refund_usd(r, rates) for r in refunded), ZERO))
+
+    # --- average order value
+    if (re.search(r"\b(average|avg|mean)\b", qf) or "per order" in qf
+            or ("worth" in qf and "order" in qf)):
         if not paid:
             return 0
-        if re.search(r"\b(usd|us dollars?|dollars?)\b", q):
-            values = [amount_usd(r, rates) for r in paid]
-        else:
-            values = [row_amount(r) or 0 for r in paid]
-        return round(sum(values) / len(values), 2)
+        return money(sum((amount_usd(r, rates) for r in paid), ZERO) / len(paid))
 
-    # Handle refund counts separately from refund amounts.
-    refund_question = any(
-        word in q for word in ("refund", "refunded", "money returned")
-    )
+    # --- top product / customer
+    topword = re.search(r"\b(top|best|highest|most|biggest|leading|best-selling|bestselling)\b|which (product|customer)", qf)
+    nmatch = re.search(r"\btop\s+(\d+)\b", qf)
+    n = int(nmatch.group(1)) if nmatch else None
+    by_units = bool(re.search(r"\b(units?|quantity|qty|pieces)\b", qf))
+    if topword and re.search(r"\bproducts?\b", qf):
+        return top_items(paid, row_product, rates, by_units, n)
+    if topword and re.search(r"\bcustomers?\b", qf):
+        return top_items(paid, row_customer, rates, by_units, n)
 
-    if refund_question:
-        refunded = [
-            r for r in selected
-            if row_status(r) in ("refunded", "partially_refunded",
-                                 "partially refunded")
-        ]
-
-        asks_count = (
-            "how many" in q
-            or "number of" in q
-            or "count of" in q
-            or "count the" in q
-            or "quantity of" in q
-        )
-
-        if asks_count:
-            return len(refunded)
-
-        # Prefer explicit refund fields; otherwise treat refunded
-        # orders as full-order refunds using their order amounts.
-        asks_usd = bool(re.search(r"\\b(usd|us dollars?|dollars?)\\b", q))
-        total = 0.0
-
-        for r in refunded:
-            direct_usd = parse_number(get_value(
-                r, ["refund_usd", "refund_amount_usd"]
-            ))
-            refund_value = row_refund(r)
-
-            if asks_usd:
-                if direct_usd is not None:
-                    total += direct_usd
-                elif refund_value:
-                    currency = str(get_value(r, ["currency"], "USD")).upper()
-                    rate_map = rates.get("usd_per_unit", {}) if isinstance(rates, dict) else {}
-                    rate = parse_number(rate_map.get(currency))
-                    if currency == "USD":
-                        rate = 1.0
-                    if rate is not None:
-                        total += refund_value * rate
-                else:
-                    total += amount_usd(r, rates)
-            else:
-                total += refund_value if refund_value else (row_amount(r) or 0)
-
-        return round(total, 2)
-
-    if any(word in q for word in ("how many orders", "number of orders",
-                                  "count of orders", "order count")):
+    # --- order counts
+    if re.search(r"how many orders|number of orders|count of orders|order count|total orders", qf):
+        if re.search(r"\bunpaid\b", qf):
+            return len([r for r in selected if row_status(r) != "paid"])
+        for hint in STATUS_HINTS:
+            if hint in qf:
+                return len([r for r in selected if hint in row_status(r)])
+        if re.search(r"\bpaid\b", qf):
+            return len(paid)
         return len(selected)
 
-    # Count distinct customers, with optional paid-only restriction.
-    customer_count_phrases = (
-        "how many customers",
-        "how many distinct customers",
-        "distinct customers",
-        "number of customers",
-        "unique customers",
-        "customer count",
-        "customers have bought",
-        "customers bought",
-        "customers purchased",
-        "customers have purchased",
-    )
+    # --- units sold
+    if by_units and re.search(r"\b(how many|number of|total)\b", qf):
+        return int(sum((row_units(r) for r in paid), ZERO)) if all(
+            row_units(r) == int(row_units(r)) for r in paid) else float(
+            sum((row_units(r) for r in paid), ZERO))
 
-    if any(phrase in q for phrase in customer_count_phrases):
-        paid_only_requested = any(phrase in q for phrase in (
-            "paid orders only",
-            "paid only",
-            "only paid",
-            "paid orders",
-        ))
-        customer_rows = paid if paid_only_requested else selected
-        return len({
-            row_customer(r)
-            for r in customer_rows
-            if row_customer(r)
-        })
+    # --- distinct customers
+    if (re.search(r"\b(how many|number of|count of|count)\b", qf)
+            and re.search(r"\b(customers|distinct customer|unique customer)\b", qf)) \
+            or re.search(r"customer count|distinct customers|unique customers", qf):
+        pool = paid if re.search(r"\bpaid\b", qf) else selected
+        return len({row_customer(r).lower() for r in pool if row_customer(r)})
 
-    if any(word in q for word in ("top product", "top-selling product", "top selling product",
-                                  "best-selling product", "best selling product",
-                                  "bestselling product", "most popular product")):
-        totals = {}
-        for r in paid:
-            name = row_product(r)
-            if name:
-                totals[name] = totals.get(name, 0) + amount_usd(r, rates)
-        return max(totals, key=totals.get) if totals else None
-
-    if any(word in q for word in ("top customer", "biggest customer",
-                                  "highest spending customer")):
-        totals = {}
-        for r in paid:
-            name = row_customer(r)
-            if name:
-                totals[name] = totals.get(name, 0) + amount_usd(r, rates)
-        return max(totals, key=totals.get) if totals else None
-
-    # Default: questions about revenue, sales or total sales.
-    if any(word in q for word in ("revenue", "sales", "sold", "income", "total", "earn", "earned", "make", "made", "generate", "generated")):
-        if re.search(r"\b(usd|us dollars?|dollars?)\b", q):
-            return round(sum(amount_usd(r, rates) for r in paid), 2)
-        return round(sum(row_amount(r) or 0 for r in paid), 2)
-
-    return {
-        "error": "Could not determine the requested metric",
-        "hint": "Ask about revenue, refunds, orders, products, or customers.",
-    }
+    # --- default: revenue in USD from paid orders
+    return money(sum((amount_usd(r, rates) for r in paid), ZERO))
 
 
+# ------------------------------------------------------------------- routes
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({"service": "Acme Appliances Ledger Agent", "status": "ok"})
 
 
 @app.route("/", methods=["POST"])
+@app.route("/ask", methods=["POST"])
 def ask():
     body = request.get_json(silent=True) or {}
     question = body.get("question")
-
     if not isinstance(question, str) or not question.strip():
         return jsonify({"error": "JSON field 'question' is required"}), 400
-
     try:
-        answer = answer_question(question.strip())
-        return jsonify({"answer": answer})
+        return jsonify({"answer": answer_question(question)})
     except Exception:
-        app.logger.exception("Question processing failed")
+        log.exception("Question processing failed")
         return jsonify({"error": "Could not process question"}), 500
 
 
