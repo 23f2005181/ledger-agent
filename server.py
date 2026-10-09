@@ -393,7 +393,7 @@ def answer_question(question):
         return max(totals, key=totals.get) if totals else None
 
     # Default: questions about revenue, sales or total sales.
-    if any(word in q for word in ("revenue", "sales", "sold", "income", "total")):
+    if any(word in q for word in ("revenue", "sales", "sold", "income", "total", "earn", "earned", "make", "made", "generate", "generated")):
         return round(sum(row_amount(r) or 0 for r in paid), 2)
 
     return {
