@@ -5,6 +5,8 @@ import csv
 import io
 import json
 import calendar
+from concurrent.futures import ThreadPoolExecutor
+import threading
 from datetime import datetime, date
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
@@ -88,53 +90,59 @@ def find_rows(data):
 
 
 def fetch_all_pages(first_url):
-    """Follow pagination links or increment a page parameter."""
-    all_rows = []
-    seen_urls = set()
-    url = first_url
+    """Fetch paginated orders concurrently when total pages are available."""
+    first_payload = fetch(first_url)
+    first_rows = find_rows(first_payload)
 
-    for page_number in range(1, 501):
-        if not url or url in seen_urls:
+    if not isinstance(first_payload, dict):
+        return first_rows
+
+    try:
+        total_pages = int(first_payload.get("pages", 0))
+    except (TypeError, ValueError):
+        total_pages = 0
+
+    if total_pages > 1:
+        parts = urlparse(first_url)
+        base_params = parse_qs(parts.query)
+
+        def fetch_page(page_number):
+            params = dict(base_params)
+            params["page"] = [str(page_number)]
+            page_url = urlunparse(
+                parts._replace(query=urlencode(params, doseq=True))
+            )
+            return find_rows(fetch(page_url))
+
+        page_numbers = range(2, total_pages + 1)
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            page_results = list(pool.map(fetch_page, page_numbers))
+
+        rows = list(first_rows)
+        for page_rows in page_results:
+            rows.extend(page_rows)
+        return rows
+
+    # Fallback for APIs that expose only next-page links.
+    all_rows = list(first_rows)
+    seen_urls = {first_url}
+    url = first_payload.get("next")
+
+    while url:
+        url = requests.compat.urljoin(first_url, url)
+        if url in seen_urls:
             break
         seen_urls.add(url)
 
         payload = fetch(url)
         rows = find_rows(payload)
-
         if not rows:
             break
-
         all_rows.extend(rows)
 
         if not isinstance(payload, dict):
             break
-
-        next_url = payload.get("next")
-        if not next_url:
-            links = payload.get("links", {})
-            if isinstance(links, dict):
-                next_url = links.get("next")
-
-        if next_url:
-            url = requests.compat.urljoin(url, next_url)
-            continue
-
-        # If the response reports pagination, use it.
-        pagination = payload.get("pagination", {})
-        has_more = (
-            isinstance(pagination, dict)
-            and pagination.get("has_more") is True
-        )
-        if has_more:
-            parts = urlparse(first_url)
-            params = parse_qs(parts.query)
-            params["page"] = [str(page_number + 1)]
-            url = urlunparse(
-                parts._replace(query=urlencode(params, doseq=True))
-            )
-            continue
-
-        break
+        url = payload.get("next")
 
     return all_rows
 
@@ -225,7 +233,7 @@ def latest_orders(rows):
     return [item[1] for item in latest.values()] + without_id
 
 
-def load_ledger():
+def _load_ledger_uncached():
     if not ROOT_URL:
         raise RuntimeError("LEDGER_URL environment variable is not configured")
 
@@ -261,6 +269,24 @@ def load_ledger():
         )
 
     return latest_orders(orders), rates_data, export_data
+
+
+
+_LEDGER_CACHE = None
+_LEDGER_CACHE_LOCK = threading.Lock()
+
+
+def load_ledger():
+    """Reuse ledger data across questions handled by this worker."""
+    global _LEDGER_CACHE
+
+    if _LEDGER_CACHE is not None:
+        return _LEDGER_CACHE
+
+    with _LEDGER_CACHE_LOCK:
+        if _LEDGER_CACHE is None:
+            _LEDGER_CACHE = _load_ledger_uncached()
+        return _LEDGER_CACHE
 
 
 def row_date(row):
